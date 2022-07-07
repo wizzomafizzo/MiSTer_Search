@@ -12,7 +12,7 @@ import zipfile
 
 ROLL_LIMIT = 100
 CMD_INTERFACE = "/dev/MiSTer_cmd"
-MGL_PATH = "/tmp/randomizer.mgl"
+MGL_PATH = "/tmp/random.mgl"
 
 # (<games folder name>, <relative rbf location>, (<set of file extensions>, <delay>, <type>, <index>)[])
 MGL_MAP = (
@@ -151,8 +151,9 @@ def get_system_paths():
     return systems
 
 
-def is_valid_file(system, filename, recurse=True):
-    is_dir = os.path.isdir(filename) or os.path.sep in filename
+def is_valid_file(system, folder, filename, recurse=True):
+    path = os.path.join(folder, filename)
+    is_dir = os.path.isdir(path) or os.path.sep in filename
     is_match = match_system_file(system, filename) is not None
     is_zip = filename.lower().endswith(".zip")
     return (recurse and is_dir) or is_match or (recurse and is_zip)
@@ -160,14 +161,14 @@ def is_valid_file(system, filename, recurse=True):
 
 def random_file(system_name, path):
     system = get_system(system_name)
-    files = [x for x in os.listdir(path) if is_valid_file(system, x)]
+    files = [x for x in os.listdir(path) if is_valid_file(system, path, x)]
     if len(files) == 0:
         return
 
     file = os.path.join(path, random_item(files))
     if os.path.isdir(file):
         # directory
-        return random_file(file)
+        return random_file(system_name, file)
     elif (
         file.lower().endswith(".zip")
         and not type_has_zip(system)
@@ -175,7 +176,7 @@ def random_file(system_name, path):
     ):
         # zip file
         zip = zipfile.ZipFile(file)
-        files = [x for x in zip.namelist() if is_valid_file(system, x, False)]
+        files = [x for x in zip.namelist() if is_valid_file(system, path, x, False)]
         if len(files) == 0:
             return
         file = os.path.join(file, random_item(files))
@@ -207,7 +208,7 @@ def launch_game(system_name, path):
         create_mgl_file(system_name, path)
         launch_path = MGL_PATH
 
-    # os.system(f'echo "load_core {launch_path}" > {CMD_INTERFACE}')
+    os.system(f'echo "load_core {launch_path}" > {CMD_INTERFACE}')
     sys.exit(0)
 
 
@@ -217,3 +218,5 @@ if __name__ == "__main__":
     if game:
         print(f"Launching: [{game[0]}] {game[1]}")
         launch_game(*game)
+    else:
+        print("No game found.")
