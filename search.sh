@@ -8,8 +8,11 @@ import tempfile
 import sys
 import random
 import math
+import curses
 from io import BytesIO
 
+
+# TODO: ignore results on external media not plugged in
 
 DB_PATH = "/media/fat/search.db"
 CMD_INTERFACE = "/dev/MiSTer_cmd"
@@ -280,11 +283,351 @@ def launch_game(system_name, path):
     sys.exit(0)
 
 
+def _draw_keyboard_input(stdscr, text=""):
+    k = 0
+
+    stdscr.clear()
+    stdscr.refresh()
+
+    curses.start_color()
+    curses.init_pair(1, curses.COLOR_BLUE, curses.COLOR_WHITE)
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_WHITE)
+    curses.init_pair(3, curses.COLOR_BLACK, curses.COLOR_WHITE)
+    curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(5, curses.COLOR_YELLOW, curses.COLOR_BLUE)
+
+    LIGHT_BLUE_ON_GREY = curses.color_pair(1) | curses.A_BOLD
+    WHITE_ON_GREY = curses.color_pair(2) | curses.A_BOLD
+    BLACK_ON_GREY = curses.color_pair(3)
+    WHITE_ON_BLUE = curses.color_pair(4) | curses.A_BOLD
+    DARK_GREY_ON_GREY = curses.color_pair(3) | curses.A_BOLD
+    YELLOW_ON_BLUE = curses.color_pair(5) | curses.A_BOLD
+
+    dialog_height = 14
+    dialog_width = 75
+    dialog_title = "Search"
+
+    KEYS = (
+        ("Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"),
+        ("A", "S", "D", "F", "G", "H", "J", "K", "L", "SPC"),
+        ("Z", "X", "C", "V", "B", "N", "M", "LAR", "RAR", "DEL"),
+    )
+
+    BUTTONS = 2
+    KEYBOARD = 1
+    focused_element = KEYBOARD
+    focused_key = [0, 0]
+    focused_button = 0
+    input_text = ""
+    input_cursor = len(input_text)
+    max_len = dialog_width - 8
+
+    while k != 27:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+
+        if k == curses.KEY_DOWN:
+            if focused_element == KEYBOARD:
+                if focused_key[0] >= 2:
+                    focused_element = BUTTONS
+                    if focused_key[1] <= 3:
+                        focused_button = 0
+                    elif focused_key[1] <= 5:
+                        focused_button = 1
+                    elif focused_key[1] >= 6:
+                        focused_button = 2
+                else:
+                    focused_key[0] += 1
+        elif k == curses.KEY_UP:
+            if focused_element == BUTTONS:
+                focused_element = KEYBOARD
+                if focused_button == 0:
+                    focused_key[1] = 2
+                elif focused_button == 1:
+                    focused_key[1] = 4
+                elif focused_button == 2:
+                    focused_key[1] = 7
+            elif focused_element == KEYBOARD:
+                if focused_key[0] > 0:
+                    focused_key[0] -= 1
+        elif k == curses.KEY_RIGHT:
+            if focused_element == KEYBOARD:
+                if focused_key[1] >= len(KEYS[focused_key[0]]) - 1:
+                    focused_key[1] = 0
+                else:
+                    focused_key[1] += 1
+            elif focused_element == BUTTONS:
+                if focused_button >= 2:
+                    focused_button = 0
+                else:
+                    focused_button += 1
+        elif k == curses.KEY_LEFT:
+            if focused_element == KEYBOARD:
+                if focused_key[1] <= 0:
+                    focused_key[1] = len(KEYS[focused_key[0]]) - 1
+                else:
+                    focused_key[1] -= 1
+            elif focused_element == BUTTONS:
+                if focused_button <= 0:
+                    focused_button = 2
+                else:
+                    focused_button -= 1
+        elif k == curses.KEY_ENTER or k == 10 or k == 13:
+            if focused_element == KEYBOARD:
+                key_at = KEYS[focused_key[0]][focused_key[1]]
+                text_start = input_text[:input_cursor]
+                text_end = input_text[input_cursor:]
+                if key_at == "SPC":
+                    if len(input_text) < max_len:
+                        input_text = text_start + " " + text_end
+                        input_cursor += 1
+                elif key_at == "DEL":
+                    if input_cursor > 0:
+                        input_text = text_start[:-1] + text_end
+                        input_cursor -= 1
+                elif key_at == "LAR":
+                    if input_cursor > 0:
+                        input_cursor -= 1
+                elif key_at == "RAR":
+                    if input_cursor < len(input_text):
+                        input_cursor += 1
+                else:
+                    if len(input_text) < max_len:
+                        input_text = text_start + key_at.lower() + text_end
+                        input_cursor += 1
+            elif focused_element == BUTTONS:
+                return (focused_button, input_text)
+
+        dialog_x = int((width // 2) - (dialog_width // 2) - dialog_width % 2)
+        dialog_y = int((height // 2) - (dialog_height // 2) - dialog_height % 2)
+
+        input_start = (0, 0)
+
+        def draw_dialog(focused=-1):
+            # box outline
+            pos_x = dialog_x
+            pos_y = dialog_y
+
+            stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, WHITE_ON_GREY)
+            pos_x += 1
+            line_len = (dialog_width // 2) - (len(dialog_title) // 2)
+            for _ in range(0, line_len):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
+                pos_x += 1
+            stdscr.addstr(pos_y, pos_x, dialog_title, LIGHT_BLUE_ON_GREY)
+            pos_x += len(dialog_title)
+            for _ in range(0, line_len):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
+                pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, BLACK_ON_GREY)
+
+            pos_y += 1
+            pos_x = dialog_x
+            for _ in range(0, dialog_height - 2):
+                stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, WHITE_ON_GREY)
+                pos_x += 1
+                stdscr.addstr(pos_y, pos_x, " " * (dialog_width - 1), WHITE_ON_GREY)
+                pos_x += dialog_width - 1
+                stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, BLACK_ON_GREY)
+                pos_x = dialog_x
+                pos_y += 1
+
+            stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, WHITE_ON_GREY)
+            pos_x += 1
+            for _ in range(0, dialog_width - 1):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, BLACK_ON_GREY)
+                pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, BLACK_ON_GREY)
+
+            # buttons separator line
+            pos_x = dialog_x
+            pos_y = dialog_y + dialog_height - 3
+            stdscr.addch(pos_y, pos_x, curses.ACS_LTEE, WHITE_ON_GREY)
+            pos_x += 1
+            for _ in range(0, dialog_width - 1):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
+                pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_RTEE, BLACK_ON_GREY)
+
+            # buttons
+            pos_x = dialog_x + 15
+            pos_y += 1
+
+            def print_button(text, width, button_focused):
+                nonlocal pos_x
+                pad = math.ceil((width - len(text)) / 2)
+                stdscr.addch(
+                    pos_y,
+                    pos_x,
+                    "<",
+                    WHITE_ON_BLUE if button_focused else BLACK_ON_GREY,
+                )
+                pos_x += 1
+                stdscr.addstr(
+                    pos_y,
+                    pos_x,
+                    " " * pad,
+                    WHITE_ON_BLUE if button_focused else WHITE_ON_GREY,
+                )
+                pos_x += pad
+                stdscr.addstr(
+                    pos_y,
+                    pos_x,
+                    text,
+                    YELLOW_ON_BLUE if button_focused else DARK_GREY_ON_GREY,
+                )
+                pos_x += len(text)
+                stdscr.addstr(
+                    pos_y,
+                    pos_x,
+                    " " * pad,
+                    WHITE_ON_BLUE if button_focused else WHITE_ON_GREY,
+                )
+                pos_x += pad
+                stdscr.addch(
+                    pos_y,
+                    pos_x,
+                    ">",
+                    WHITE_ON_BLUE if button_focused else BLACK_ON_GREY,
+                )
+                pos_x += 1
+
+            values = ("Search", "Advanced", "Exit")
+            for i in range(0, 3):
+                print_button(values[i], 7, focused == i)
+                pos_x += 8
+
+        def draw_input_box():
+            nonlocal input_start
+
+            pos_x = dialog_x + 2
+            pos_y = dialog_y + 1
+
+            stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, BLACK_ON_GREY)
+            pos_x += 1
+            for _ in range(0, dialog_width - 5):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, BLACK_ON_GREY)
+                pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, WHITE_ON_GREY)
+
+            pos_y += 1
+            pos_x = dialog_x + 2
+            stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, BLACK_ON_GREY)
+            pos_x += 1
+            stdscr.addch(pos_y, pos_x, " ", BLACK_ON_GREY)
+            pos_x += 1
+            input_start = (pos_y, pos_x)
+            stdscr.addstr(
+                pos_y,
+                pos_x,
+                " " * (dialog_width - 7),
+                BLACK_ON_GREY,
+            )
+            pos_x += dialog_width - 7
+            stdscr.addch(pos_y, pos_x, " ", BLACK_ON_GREY)
+            pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, WHITE_ON_GREY)
+
+            pos_x = dialog_x + 2
+            pos_y += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, BLACK_ON_GREY)
+            pos_x += 1
+            for _ in range(0, dialog_width - 5):
+                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
+                pos_x += 1
+            stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, WHITE_ON_GREY)
+
+            stdscr.addstr(input_start[0], input_start[1], input_text, BLACK_ON_GREY)
+
+        def draw_keyboard(focused_row=-1, focused_col=-1):
+            pos_x = dialog_x + 4
+            pos_y = dialog_y + 5
+
+            for fr, row in enumerate(KEYS):
+                for fc, key in enumerate(row):
+                    if fr == focused_row and fc == focused_col:
+                        selected = True
+                    else:
+                        selected = False
+
+                    if key == "LAR":
+                        key = curses.ACS_LARROW
+                    elif key == "RAR":
+                        key = curses.ACS_RARROW
+
+                    stdscr.addch(
+                        pos_y, pos_x, "[", WHITE_ON_BLUE if selected else BLACK_ON_GREY
+                    )
+                    pos_x += 1
+                    if type(key) is str and len(key) == 3:
+                        stdscr.addstr(
+                            pos_y,
+                            pos_x,
+                            key,
+                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                        )
+                        pos_x += 3
+                    else:
+                        stdscr.addch(
+                            pos_y,
+                            pos_x,
+                            " ",
+                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                        )
+                        pos_x += 1
+                        stdscr.addch(
+                            pos_y,
+                            pos_x,
+                            key,
+                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                        )
+                        pos_x += 1
+                        stdscr.addch(
+                            pos_y,
+                            pos_x,
+                            " ",
+                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                        )
+                        pos_x += 1
+                    stdscr.addch(
+                        pos_y, pos_x, "]", WHITE_ON_BLUE if selected else BLACK_ON_GREY
+                    )
+                    pos_x += 3
+                pos_x = dialog_x + 4
+                pos_y += 2
+
+        if focused_element == BUTTONS:
+            draw_dialog(focused_button)
+        else:
+            draw_dialog(-1)
+
+        if focused_element == KEYBOARD:
+            draw_keyboard(focused_key[0], focused_key[1])
+        else:
+            draw_keyboard(-1, -1)
+
+        draw_input_box()
+
+        stdscr.move(input_start[0], input_start[1] + input_cursor)
+
+        stdscr.refresh()
+        k = stdscr.getch()
+
+
+def display_keyboard_input(text=""):
+    button, text = curses.wrapper(_draw_keyboard_input, text)
+    if button == 0:
+        if text == "":
+            display_keyboard_input()
+            return
+        display_search_results(text)
+
+
 def dialog_env():
     return dict(os.environ, DIALOGRC="/media/fat/Scripts/.dialogrc")
 
 
-def display_search_input(query=""):
+def display_text_input(query=""):
     args = [
         "dialog",
         "--title",
@@ -342,7 +685,7 @@ def display_search_results(query):
 
     if len(search) == 0:
         display_message("No results found.")
-        display_search_input(query)
+        display_keyboard_input(query)
         return
 
     names = set()
@@ -385,7 +728,7 @@ def display_search_results(query):
         selected = filtered_search[int(index) - 1]
         launch_game(selected[0], selected[1])
     else:
-        display_search_input()
+        display_keyboard_input(query)
 
 
 def display_generate_db():
@@ -434,4 +777,4 @@ def get_count(system=None):
 if __name__ == "__main__":
     if not os.path.exists(DB_PATH):
         display_generate_db()
-    display_search_input()
+    display_keyboard_input()
