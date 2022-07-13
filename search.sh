@@ -9,6 +9,8 @@ import sys
 import random
 import math
 import curses
+import threading
+import time
 from io import BytesIO
 
 
@@ -170,106 +172,158 @@ def get_system_files(name, folder):
                     match = match_system_file(system, zip_path)
                     if match:
                         full_path = os.path.join(path, zip_path)
-                        game_name, ext = os.path.splitext(os.path.basename(zip_path))
+                        game_name, _ = os.path.splitext(os.path.basename(zip_path))
                         yield (full_path, game_name)
 
             else:
                 # regular files
                 match = match_system_file(system, filename)
                 if match is not None:
-                    game_name, ext = os.path.splitext(filename)
+                    game_name, _ = os.path.splitext(filename)
                     yield (path, game_name)
 
 
-# create new index db file, yields at progress points
-def generate_db():
-    system_paths = get_system_paths()
-    count_index = ""
+class Database:
+    def __init__(self):
+        self.indexes = []
+        self.counts = []
+        self.ready = False
+        self.load_thread = None
+        self.search_ready = False
+        self.search_results = []
+        self.search_thread = None
 
-    paths_total = 0
-    for paths in system_paths.values():
-        paths_total += len(paths)
+    # create new index db file, yields at progress points
+    def generate(self):
+        system_paths = get_system_paths()
+        count_index = ""
 
-    tar = tarfile.open(DB_PATH, "w:")
+        paths_total = 0
+        for paths in system_paths.values():
+            paths_total += len(paths)
 
-    def add(name, s: str):
-        info = tarfile.TarInfo(name)
-        info.size = len(s)
-        tar.addfile(info, BytesIO(s.encode("utf-8")))
+        tar = tarfile.open(DB_PATH, "w:")
 
-    for system in sorted(system_paths.keys()):
-        path_index = ""
-        name_index = ""
-        count = 0
+        def add(name, s: str):
+            info = tarfile.TarInfo(name)
+            info.size = len(s)
+            tar.addfile(info, BytesIO(s.encode("utf-8")))
 
-        for system_path in system_paths[system]:
-            yield system, system_path, paths_total
+        for system in sorted(system_paths.keys()):
+            path_index = ""
+            name_index = ""
+            count = 0
 
-            for file_path, name in get_system_files(system, system_path):
-                path_index += file_path + "\n"
-                name_index += name + "\n"
-                count += 1
+            for system_path in system_paths[system]:
+                yield system, system_path, paths_total
 
-        add(system + "__path", path_index)
-        add(system + "__name", name_index)
-        count_index += f"{system}\t{count}\n"
+                for file_path, name in get_system_files(system, system_path):
+                    path_index += file_path + "\n"
+                    name_index += name + "\n"
+                    count += 1
 
-    add("_count", count_index)
-    tar.close()
+            add(system + "__path", path_index)
+            add(system + "__name", name_index)
+            count_index += f"{system}\t{count}\n"
 
-def get_db():
-    return tarfile.open(DB_PATH, "r:")
+        add("_count", count_index)
+        tar.close()
 
+    def exists(self):
+        return os.path.exists(DB_PATH)
 
-def search_name(db: tarfile.TarFile, query: str):
-    results = []
-    query_words = query.split()
+    def load(self):
+        if self.ready:
+            return
 
-    if len(query_words) == 0:
-        return []
-
-    for index_name in db.getnames():
-        if not index_name.endswith("__name"):
-            continue
-
-        system_name = index_name[:-6]
-
-        name_file = tempfile.NamedTemporaryFile()
-        index = db.extractfile(index_name).read()
-        name_file.write(index)
-
-        grep = subprocess.run(
-            ["grep", "-in", query_words[0], name_file.name],
-            text=True,
-            capture_output=True,
-        )
-        grep_output = grep.stdout.splitlines()
-
-        if len(query_words) > 1:
-            for word in query_words[1:]:
-                grep_output = [
-                    x for x in grep_output if word.casefold() in x.casefold()
-                ]
-
-        grep_results = []
-        for line in grep_output:
-            lineno, name = line.split(":", 1)
-            grep_results.append((int(lineno), name))
-
-        name_file.close()
-
-        if len(grep_results) > 0:
-            path_index = (
-                db.extractfile(system_name + "__path")
-                .read()
-                .decode("utf-8")
-                .splitlines()
+        tar = tarfile.open(DB_PATH, "r:")
+        for path_file in [x for x in tar.getnames() if x.endswith("__path")]:
+            system = path_file.split("__")[0]
+            name_file = system + "__name"
+            self.indexes.append(
+                (
+                    system,
+                    tar.extractfile(path_file).read().decode("utf-8"),
+                    tar.extractfile(name_file).read().decode("utf-8"),
+                )
             )
 
-            for lineno, name in grep_results:
-                results.append((system_name, path_index[lineno - 1], name))
+        count_file = tar.extractfile("_count").read().decode("utf-8").splitlines()
+        for line in count_file:
+            system, count = line.split("\t")
+            self.counts.append((system, int(count)))
 
-    return results
+        self.ready = True
+        tar.close()
+
+    def load_in_background(self):
+        if self.ready:
+            return
+
+        self.load_thread = threading.Thread(target=self.load)
+        self.load_thread.start()
+
+    def search(self, query: str, filtered=True):
+        while not self.ready:
+            time.sleep(0.1)
+
+        self.search_ready = False
+        results = []
+        query_words = query.split()
+
+        if len(query_words) == 0:
+            return []
+
+        for system, paths, names in self.indexes:
+            name_file = tempfile.NamedTemporaryFile()
+            name_file.write(names.encode("utf-8"))
+
+            grep = subprocess.run(
+                ["grep", "-in", query_words[0], name_file.name],
+                text=True,
+                capture_output=True,
+            )
+            grep_output = grep.stdout.splitlines()
+
+            if len(query_words) > 1:
+                for word in query_words[1:]:
+                    grep_output = [
+                        x for x in grep_output if word.casefold() in x.casefold()
+                    ]
+
+            grep_results = []
+            for line in grep_output:
+                line_num, name = line.split(":", 1)
+                grep_results.append((int(line_num), name))
+
+            if len(grep_results) > 0:
+                for line_num, name in grep_results:
+                    results.append((system, paths[line_num - 1], name))
+
+        if filtered:
+            names = set()
+            filtered_results = []
+            for result in results:
+                if result[2] in name:
+                    continue
+                names.add(result[2])
+                filtered_results.append(result)
+            filtered_results.sort(key=lambda x: x[2])
+            results = filtered_results
+
+        self.search_results = results
+        self.search_ready = True
+        return results
+
+    def search_in_background(self, query: str, filtered=True):
+        self.search_thread = threading.Thread(
+            target=self.search, args=(query, filtered)
+        )
+        self.search_thread.start()
+
+    def count(self, system=None):
+        if not system:
+            return sum(x[1] for x in self.counts)
 
 
 def launch_game(system_name, path):
@@ -283,12 +337,7 @@ def launch_game(system_name, path):
     sys.exit(0)
 
 
-def _draw_keyboard_input(stdscr, text=""):
-    k = 0
-
-    stdscr.clear()
-    stdscr.refresh()
-
+def get_curses_colors():
     curses.start_color()
     curses.init_pair(1, curses.COLOR_BLUE, curses.COLOR_WHITE)
     curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_WHITE)
@@ -296,12 +345,177 @@ def _draw_keyboard_input(stdscr, text=""):
     curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(5, curses.COLOR_YELLOW, curses.COLOR_BLUE)
 
-    LIGHT_BLUE_ON_GREY = curses.color_pair(1) | curses.A_BOLD
-    WHITE_ON_GREY = curses.color_pair(2) | curses.A_BOLD
-    BLACK_ON_GREY = curses.color_pair(3)
-    WHITE_ON_BLUE = curses.color_pair(4) | curses.A_BOLD
-    DARK_GREY_ON_GREY = curses.color_pair(3) | curses.A_BOLD
-    YELLOW_ON_BLUE = curses.color_pair(5) | curses.A_BOLD
+    return {
+        "LBOG": curses.color_pair(1) | curses.A_BOLD,
+        "WOG": curses.color_pair(2) | curses.A_BOLD,
+        "BOG": curses.color_pair(3),
+        "WOB": curses.color_pair(4) | curses.A_BOLD,
+        "DGOG": curses.color_pair(3) | curses.A_BOLD,
+        "YOB": curses.color_pair(5) | curses.A_BOLD,
+    }
+
+
+def draw_dialog_box(stdscr, colors, width: int, height: int, title: str):
+    screen_height, screen_width = stdscr.getmaxyx()
+
+    dialog_x = int((screen_width // 2) - (width // 2) - width % 2)
+    dialog_y = int((screen_height // 2) - (height // 2) - height % 2)
+
+    pos_x = dialog_x
+    pos_y = dialog_y
+
+    stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, colors["WOG"])
+    pos_x += 1
+    line_len = (width // 2) - (len(title) // 2)
+    for _ in range(0, line_len):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["WOG"])
+        pos_x += 1
+    stdscr.addstr(pos_y, pos_x, title, colors["LBOG"])
+    pos_x += len(title)
+    for _ in range(0, line_len):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["WOG"])
+        pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, colors["BOG"])
+
+    hline_width = (line_len * 2) + len(title)
+
+    pos_y += 1
+    pos_x = dialog_x
+    for _ in range(0, height - 2):
+        stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, colors["WOG"])
+        pos_x += 1
+        stdscr.addstr(pos_y, pos_x, " " * hline_width, colors["WOG"])
+        pos_x += hline_width
+        stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, colors["BOG"])
+        pos_x = dialog_x
+        pos_y += 1
+
+    stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, colors["WOG"])
+    pos_x += 1
+    for _ in range(0, hline_width):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["BOG"])
+        pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, colors["BOG"])
+
+    return dialog_y, dialog_x
+
+
+def draw_search_buttons(
+    stdscr, colors, offset_y, offset_x, dialog_width, dialog_height, focused
+):
+    # buttons separator line
+    pos_x = offset_x
+    pos_y = offset_y + dialog_height - 3
+    stdscr.addch(pos_y, pos_x, curses.ACS_LTEE, colors["WOG"])
+    pos_x += 1
+    for _ in range(0, dialog_width - 1):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["WOG"])
+        pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_RTEE, colors["BOG"])
+
+    # buttons
+    pos_x = offset_x + 15
+    pos_y += 1
+
+    def print_button(text, width, button_focused):
+        nonlocal pos_x
+        pad = math.ceil((width - len(text)) / 2)
+        stdscr.addch(
+            pos_y,
+            pos_x,
+            "<",
+            colors["WOB"] if button_focused else colors["BOG"],
+        )
+        pos_x += 1
+        stdscr.addstr(
+            pos_y,
+            pos_x,
+            " " * pad,
+            colors["WOB"] if button_focused else colors["WOG"],
+        )
+        pos_x += pad
+        stdscr.addstr(
+            pos_y,
+            pos_x,
+            text,
+            colors["YOB"] if button_focused else colors["DGOG"],
+        )
+        pos_x += len(text)
+        stdscr.addstr(
+            pos_y,
+            pos_x,
+            " " * pad,
+            colors["WOB"] if button_focused else colors["WOG"],
+        )
+        pos_x += pad
+        stdscr.addch(
+            pos_y,
+            pos_x,
+            ">",
+            colors["WOB"] if button_focused else colors["BOG"],
+        )
+        pos_x += 1
+
+    values = ("Search", "Advanced", "Exit")
+    for i in range(0, 3):
+        print_button(values[i], 7, focused == i)
+        pos_x += 8
+
+
+def draw_input_box(stdscr, colors, offset_y, offset_x, container_width, text):
+    pos_x = offset_x + 2
+    pos_y = offset_y + 1
+
+    stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, colors["BOG"])
+    pos_x += 1
+    for _ in range(0, container_width - 5):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["BOG"])
+        pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, colors["WOG"])
+
+    pos_y += 1
+    pos_x = offset_x + 2
+    stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, colors["BOG"])
+    pos_x += 1
+    stdscr.addch(pos_y, pos_x, " ", colors["BOG"])
+    pos_x += 1
+
+    input_start = (pos_y, pos_x)
+
+    stdscr.addstr(
+        pos_y,
+        pos_x,
+        " " * (container_width - 7),
+        colors["BOG"],
+    )
+    pos_x += container_width - 7
+    stdscr.addch(pos_y, pos_x, " ", colors["BOG"])
+    pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, colors["WOG"])
+
+    pos_x = offset_x + 2
+    pos_y += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, colors["BOG"])
+    pos_x += 1
+    for _ in range(0, container_width - 5):
+        stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, colors["WOG"])
+        pos_x += 1
+    stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, colors["WOG"])
+
+    stdscr.addstr(input_start[0], input_start[1], text, colors["BOG"])
+
+    return input_start
+
+
+def _draw_keyboard_input(stdscr, text=""):
+    k = 0
+
+    stdscr.clear()
+    stdscr.refresh()
+
+    curses.curs_set(1)
+
+    colors = get_curses_colors()
 
     dialog_height = 14
     dialog_width = 75
@@ -316,15 +530,14 @@ def _draw_keyboard_input(stdscr, text=""):
     BUTTONS = 2
     KEYBOARD = 1
     focused_element = KEYBOARD
-    focused_key = [0, 0]
+    focused_key = [1, 4]
     focused_button = 0
-    input_text = ""
+    input_text = text
     input_cursor = len(input_text)
     max_len = dialog_width - 8
 
     while k != 27:
         stdscr.erase()
-        height, width = stdscr.getmaxyx()
 
         if k == curses.KEY_DOWN:
             if focused_element == KEYBOARD:
@@ -398,146 +611,21 @@ def _draw_keyboard_input(stdscr, text=""):
             elif focused_element == BUTTONS:
                 return (focused_button, input_text)
 
-        dialog_x = int((width // 2) - (dialog_width // 2) - dialog_width % 2)
-        dialog_y = int((height // 2) - (dialog_height // 2) - dialog_height % 2)
-
         input_start = (0, 0)
 
-        def draw_dialog(focused=-1):
-            # box outline
-            pos_x = dialog_x
-            pos_y = dialog_y
+        dialog_y, dialog_x = draw_dialog_box(
+            stdscr, colors, dialog_width, dialog_height, dialog_title
+        )
 
-            stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, WHITE_ON_GREY)
-            pos_x += 1
-            line_len = (dialog_width // 2) - (len(dialog_title) // 2)
-            for _ in range(0, line_len):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
-                pos_x += 1
-            stdscr.addstr(pos_y, pos_x, dialog_title, LIGHT_BLUE_ON_GREY)
-            pos_x += len(dialog_title)
-            for _ in range(0, line_len):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
-                pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, BLACK_ON_GREY)
-
-            pos_y += 1
-            pos_x = dialog_x
-            for _ in range(0, dialog_height - 2):
-                stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, WHITE_ON_GREY)
-                pos_x += 1
-                stdscr.addstr(pos_y, pos_x, " " * (dialog_width - 1), WHITE_ON_GREY)
-                pos_x += dialog_width - 1
-                stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, BLACK_ON_GREY)
-                pos_x = dialog_x
-                pos_y += 1
-
-            stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, WHITE_ON_GREY)
-            pos_x += 1
-            for _ in range(0, dialog_width - 1):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, BLACK_ON_GREY)
-                pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, BLACK_ON_GREY)
-
-            # buttons separator line
-            pos_x = dialog_x
-            pos_y = dialog_y + dialog_height - 3
-            stdscr.addch(pos_y, pos_x, curses.ACS_LTEE, WHITE_ON_GREY)
-            pos_x += 1
-            for _ in range(0, dialog_width - 1):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
-                pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_RTEE, BLACK_ON_GREY)
-
-            # buttons
-            pos_x = dialog_x + 15
-            pos_y += 1
-
-            def print_button(text, width, button_focused):
-                nonlocal pos_x
-                pad = math.ceil((width - len(text)) / 2)
-                stdscr.addch(
-                    pos_y,
-                    pos_x,
-                    "<",
-                    WHITE_ON_BLUE if button_focused else BLACK_ON_GREY,
-                )
-                pos_x += 1
-                stdscr.addstr(
-                    pos_y,
-                    pos_x,
-                    " " * pad,
-                    WHITE_ON_BLUE if button_focused else WHITE_ON_GREY,
-                )
-                pos_x += pad
-                stdscr.addstr(
-                    pos_y,
-                    pos_x,
-                    text,
-                    YELLOW_ON_BLUE if button_focused else DARK_GREY_ON_GREY,
-                )
-                pos_x += len(text)
-                stdscr.addstr(
-                    pos_y,
-                    pos_x,
-                    " " * pad,
-                    WHITE_ON_BLUE if button_focused else WHITE_ON_GREY,
-                )
-                pos_x += pad
-                stdscr.addch(
-                    pos_y,
-                    pos_x,
-                    ">",
-                    WHITE_ON_BLUE if button_focused else BLACK_ON_GREY,
-                )
-                pos_x += 1
-
-            values = ("Search", "Advanced", "Exit")
-            for i in range(0, 3):
-                print_button(values[i], 7, focused == i)
-                pos_x += 8
-
-        def draw_input_box():
-            nonlocal input_start
-
-            pos_x = dialog_x + 2
-            pos_y = dialog_y + 1
-
-            stdscr.addch(pos_y, pos_x, curses.ACS_ULCORNER, BLACK_ON_GREY)
-            pos_x += 1
-            for _ in range(0, dialog_width - 5):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, BLACK_ON_GREY)
-                pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_URCORNER, WHITE_ON_GREY)
-
-            pos_y += 1
-            pos_x = dialog_x + 2
-            stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, BLACK_ON_GREY)
-            pos_x += 1
-            stdscr.addch(pos_y, pos_x, " ", BLACK_ON_GREY)
-            pos_x += 1
-            input_start = (pos_y, pos_x)
-            stdscr.addstr(
-                pos_y,
-                pos_x,
-                " " * (dialog_width - 7),
-                BLACK_ON_GREY,
-            )
-            pos_x += dialog_width - 7
-            stdscr.addch(pos_y, pos_x, " ", BLACK_ON_GREY)
-            pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_VLINE, WHITE_ON_GREY)
-
-            pos_x = dialog_x + 2
-            pos_y += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_LLCORNER, BLACK_ON_GREY)
-            pos_x += 1
-            for _ in range(0, dialog_width - 5):
-                stdscr.addch(pos_y, pos_x, curses.ACS_HLINE, WHITE_ON_GREY)
-                pos_x += 1
-            stdscr.addch(pos_y, pos_x, curses.ACS_LRCORNER, WHITE_ON_GREY)
-
-            stdscr.addstr(input_start[0], input_start[1], input_text, BLACK_ON_GREY)
+        draw_search_buttons(
+            stdscr,
+            colors,
+            dialog_y,
+            dialog_x,
+            dialog_width,
+            dialog_height,
+            focused_button if focused_element == BUTTONS else -1,
+        )
 
         def draw_keyboard(focused_row=-1, focused_col=-1):
             pos_x = dialog_x + 4
@@ -556,7 +644,7 @@ def _draw_keyboard_input(stdscr, text=""):
                         key = curses.ACS_RARROW
 
                     stdscr.addch(
-                        pos_y, pos_x, "[", WHITE_ON_BLUE if selected else BLACK_ON_GREY
+                        pos_y, pos_x, "[", colors["WOB"] if selected else colors["BOG"]
                     )
                     pos_x += 1
                     if type(key) is str and len(key) == 3:
@@ -564,7 +652,7 @@ def _draw_keyboard_input(stdscr, text=""):
                             pos_y,
                             pos_x,
                             key,
-                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                            colors["YOB"] if selected else colors["BOG"],
                         )
                         pos_x += 3
                     else:
@@ -572,41 +660,38 @@ def _draw_keyboard_input(stdscr, text=""):
                             pos_y,
                             pos_x,
                             " ",
-                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                            colors["YOB"] if selected else colors["BOG"],
                         )
                         pos_x += 1
                         stdscr.addch(
                             pos_y,
                             pos_x,
                             key,
-                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                            colors["YOB"] if selected else colors["BOG"],
                         )
                         pos_x += 1
                         stdscr.addch(
                             pos_y,
                             pos_x,
                             " ",
-                            YELLOW_ON_BLUE if selected else BLACK_ON_GREY,
+                            colors["YOB"] if selected else colors["BOG"],
                         )
                         pos_x += 1
                     stdscr.addch(
-                        pos_y, pos_x, "]", WHITE_ON_BLUE if selected else BLACK_ON_GREY
+                        pos_y, pos_x, "]", colors["WOB"] if selected else colors["BOG"]
                     )
                     pos_x += 3
                 pos_x = dialog_x + 4
                 pos_y += 2
-
-        if focused_element == BUTTONS:
-            draw_dialog(focused_button)
-        else:
-            draw_dialog(-1)
 
         if focused_element == KEYBOARD:
             draw_keyboard(focused_key[0], focused_key[1])
         else:
             draw_keyboard(-1, -1)
 
-        draw_input_box()
+        input_start = draw_input_box(
+            stdscr, colors, dialog_y, dialog_x, dialog_width, input_text
+        )
 
         stdscr.move(input_start[0], input_start[1] + input_cursor)
 
@@ -614,20 +699,20 @@ def _draw_keyboard_input(stdscr, text=""):
         k = stdscr.getch()
 
 
-def display_keyboard_input(text=""):
+def display_keyboard_input(db: Database, text=""):
     button, text = curses.wrapper(_draw_keyboard_input, text)
     if button == 0:
         if text == "":
-            display_keyboard_input()
+            display_keyboard_input(db)
             return
-        display_search_results(text)
+        display_search_results(db, text)
 
 
 def dialog_env():
     return dict(os.environ, DIALOGRC="/media/fat/Scripts/.dialogrc")
 
 
-def display_text_input(query=""):
+def display_text_input(db: Database, query=""):
     args = [
         "dialog",
         "--title",
@@ -636,9 +721,9 @@ def display_text_input(query=""):
         "Search",
         "--cancel-label",
         "Exit",
-        # "--extra-button",
-        # "--extra-label",
-        # "Advanced",
+        "--extra-button",
+        "--extra-label",
+        "Advanced",
         "--inputbox",
         "",
         "7",
@@ -652,7 +737,7 @@ def display_text_input(query=""):
     query = result.stderr.decode()
 
     if button == 0:
-        display_search_results(query)
+        display_search_results(db, query)
 
 
 def display_message(msg, info=False, height=5, title="Search"):
@@ -676,28 +761,71 @@ def display_message(msg, info=False, height=5, title="Search"):
     subprocess.run(args, env=dialog_env())
 
 
-def display_search_results(query):
+def _draw_search_loading(stdscr, db: Database, query=""):
+    stdscr.clear()
+    stdscr.refresh()
+
+    colors = get_curses_colors()
+
+    dialog_width = max(len(query) + 4, 24)
+    dialog_height = 4
+
+    anim_frames = [
+        "|",
+        "/",
+        "-",
+        "\\",
+    ]
+    active_frame = 0
+
+    curses.curs_set(0)
+
+    db.search_in_background(query)
+
+    while not db.search_ready:
+        stdscr.erase()
+
+        dialog_y, dialog_x = draw_dialog_box(
+            stdscr, colors, dialog_width, dialog_height, "Searching..."
+        )
+
+        stdscr.addstr(
+            dialog_y + 1,
+            dialog_x + (dialog_width // 2) - (len(query) // 2),
+            query,
+            colors["BOG"],
+        )
+
+        stdscr.addstr(
+            dialog_y + 2,
+            dialog_x + (dialog_width // 2),
+            anim_frames[active_frame],
+            colors["BOG"],
+        )
+        active_frame = (active_frame + 1) % len(anim_frames)
+
+        stdscr.refresh()
+        time.sleep(0.08)
+
+
+def draw_search_loading(db: Database, query=""):
+    curses.wrapper(_draw_search_loading, db, query)
+
+
+def display_search_results(db: Database, query: str):
     # TODO: random button
-    display_message(f"Searching for: {query}", info=True, height=3)
+    draw_search_loading(db, query)
 
-    db = get_db()
-    search = search_name(db, query)
-
-    if len(search) == 0:
+    if len(db.search_results) == 0:
         display_message("No results found.")
-        display_keyboard_input(query)
+        display_keyboard_input(db, query)
         return
 
-    names = set()
-    filtered_search = []
-
-    for r in search:
-        if r[2] in names:
-            continue
-        names.add(r[2])
-        filtered_search.append(r)
-
-    filtered_search.sort(key=lambda x: x[2].lower())
+    results = db.search_results
+    total_results = len(db.search_results)
+    max_results = 1000
+    if total_results > max_results:
+        results = results[:max_results]
 
     args = [
         "dialog",
@@ -708,16 +836,15 @@ def display_search_results(query):
         "--cancel-label",
         "Cancel",
         "--menu",
-        f"Found {len(filtered_search)} results. Select game to launch:",
+        f"Found {total_results} results. Select game to launch:",
         "20",
         "75",
         "20",
     ]
 
-    for i, v in enumerate(filtered_search, start=1):
-        names.add(v[2])
+    for i, result in enumerate(results, start=1):
         args.append(str(i))
-        args.append(f"{v[2]} [{v[0]}]")
+        args.append(f"{result[2]} [{result[0]}]")
 
     result = subprocess.run(args, stderr=subprocess.PIPE, env=dialog_env())
 
@@ -725,13 +852,13 @@ def display_search_results(query):
     button = result.returncode
 
     if button == 0:
-        selected = filtered_search[int(index) - 1]
+        selected = results[int(index) - 1]
         launch_game(selected[0], selected[1])
     else:
-        display_keyboard_input(query)
+        display_keyboard_input(db, query)
 
 
-def display_generate_db():
+def display_generate_db(db: Database):
     display_message(
         "This script will now create an index of all your games. This only happens once, but it can 1-2 minutes for a large collection.",
         height=6,
@@ -752,29 +879,19 @@ def display_generate_db():
         progress = subprocess.Popen(args, env=dialog_env(), stdin=subprocess.PIPE)
         progress.communicate("".encode())
 
-    for i, v in enumerate(generate_db()):
+    for i, v in enumerate(db.generate()):
         pct = math.ceil(i / v[2] * 100)
         display_progress(f"Scanning {v[0]} ({v[1]})", pct)
 
     display_message(
-        f"Index generated successfully. Found {get_count()} games.",
+        f"Index generated successfully. Found {db.count()} games.",
         title="Indexing Complete",
     )
 
 
-def get_count(system=None):
-    db = get_db()
-    counts = db.extractfile("_count").read().decode("utf-8").splitlines()
-
-    if system is None:
-        total = 0
-        for system in counts:
-            _, count = system.split("\t", 1)
-            total += int(count)
-        return total
-
-
 if __name__ == "__main__":
-    if not os.path.exists(DB_PATH):
-        display_generate_db()
-    display_keyboard_input()
+    db = Database()
+    if not db.exists():
+        display_generate_db(db)
+    db.load_in_background()
+    display_keyboard_input(db)
