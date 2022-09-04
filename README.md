@@ -1,8 +1,5 @@
 # MiSTer Search
 
-Search for and launch games from the [MiSTer](https://github.com/MiSTer-devel/Main_MiSTer/wiki) menu.
+This repo is no longer active. See the mrext project for updated versions of search and random.
 
-## Installation
-
-1. Copy the [search.sh](https://github.com/wizzomafizzo/MiSTer_Search/raw/main/search.sh) file to your SD card's `Scripts` folder.
-2. Run `search` from the Scripts menu.
+https://github.com/wizzomafizzo/mrext
